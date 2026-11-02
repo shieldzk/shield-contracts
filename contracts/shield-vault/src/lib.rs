@@ -53,10 +53,11 @@ pub enum DataKey {
     Verifier,
     /// Address of the Groth16 verifier for the conservation circuit (instance storage).
     ConservationVerifier,
-    /// Batch data by batch id (persistent storage).
-    Batch(u64),
+    /// Batch data by funder and batch id (persistent storage). Ids are per funder, so
+    /// nobody can take another funder's id by registering it first (ADR 0003).
+    Batch(Address, u64),
     /// Spent marker for a nullifier, scoped to its batch (persistent storage).
-    Nullifier(u64, BytesN<32>),
+    Nullifier(Address, u64, BytesN<32>),
 }
 
 /// Errors returned by the vault. Any error aborts the call and rolls back all state changes.
@@ -64,7 +65,7 @@ pub enum DataKey {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum VaultError {
-    /// No batch exists with the given id.
+    /// No batch exists with the given funder and id.
     BatchNotFound = 1,
     /// The nullifier has already been used in this batch (double claim / replay).
     NullifierUsed = 2,
@@ -76,7 +77,7 @@ pub enum VaultError {
     InsufficientBatchFunds = 5,
     /// The nullifier is not a canonical field element (>= field modulus).
     NonCanonicalNullifier = 6,
-    /// A batch with this id has already been registered.
+    /// This funder has already registered a batch with this id.
     BatchExists = 7,
     /// The batch total is zero or negative.
     InvalidTotal = 8,
@@ -100,6 +101,8 @@ pub trait VerifierInterface {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Withdrawn {
     #[topic]
+    pub funder: Address,
+    #[topic]
     pub batch_id: u64,
     pub nullifier: BytesN<32>,
     pub recipient: Address,
@@ -111,8 +114,9 @@ pub struct Withdrawn {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchFunded {
     #[topic]
-    pub batch_id: u64,
     pub funder: Address,
+    #[topic]
+    pub batch_id: u64,
     pub token: Address,
     pub root: BytesN<32>,
     pub total: i128,
@@ -162,8 +166,10 @@ impl ShieldVault {
             return Err(VaultError::NonCanonicalRoot);
         }
 
-        // 2. Batch ids are never reused: commitments and nullifiers are scoped to them
-        let batch_key = DataKey::Batch(batch_id);
+        // 2. A funder never reuses a batch id: commitments and nullifiers are scoped to
+        //    it. Ids are per funder, so another funder registering the same id first
+        //    creates a separate batch and blocks nothing (ADR 0003).
+        let batch_key = DataKey::Batch(funder.clone(), batch_id);
         if env.storage().persistent().has(&batch_key) {
             return Err(VaultError::BatchExists);
         }
@@ -203,8 +209,8 @@ impl ShieldVault {
         TokenClient::new(&env, &token).transfer(&funder, env.current_contract_address(), &total);
 
         BatchFunded {
-            batch_id,
             funder,
+            batch_id,
             token,
             root,
             total,
@@ -214,7 +220,8 @@ impl ShieldVault {
         Ok(())
     }
 
-    /// Releases an allocation to `recipient` if `proof` is valid for this batch.
+    /// Releases an allocation to `recipient` if `proof` is valid for `funder`'s batch
+    /// `batch_id`.
     ///
     /// Anyone may submit the call (e.g. a relayer paying fees on the recipient's
     /// behalf): the proof binds `recipient` and `amount`, so a submitter cannot
@@ -224,6 +231,7 @@ impl ShieldVault {
     /// and the withdrawn amount, and only then transfer tokens.
     pub fn withdraw(
         env: Env,
+        funder: Address,
         batch_id: u64,
         proof: Bytes,
         nullifier: BytesN<32>,
@@ -241,7 +249,7 @@ impl ShieldVault {
         }
 
         // 2. Batch must exist
-        let batch_key = DataKey::Batch(batch_id);
+        let batch_key = DataKey::Batch(funder.clone(), batch_id);
         let mut batch: Batch = env
             .storage()
             .persistent()
@@ -251,7 +259,7 @@ impl ShieldVault {
         // 3. Nullifier must not have been used in this batch. Checked before the
         //    balance so that a double claim on a nearly drained batch is reported
         //    as NullifierUsed, not as InsufficientBatchFunds.
-        let nullifier_key = DataKey::Nullifier(batch_id, nullifier.clone());
+        let nullifier_key = DataKey::Nullifier(funder.clone(), batch_id, nullifier.clone());
         if env.storage().persistent().has(&nullifier_key) {
             return Err(VaultError::NullifierUsed);
         }
@@ -299,6 +307,7 @@ impl ShieldVault {
         );
 
         Withdrawn {
+            funder,
             batch_id,
             nullifier,
             recipient,
@@ -309,16 +318,24 @@ impl ShieldVault {
         Ok(())
     }
 
-    /// Returns true if `nullifier` has already been used to withdraw from `batch_id`.
-    pub fn is_nullifier_used(env: Env, batch_id: u64, nullifier: BytesN<32>) -> bool {
+    /// Returns true if `nullifier` has already been used to withdraw from `funder`'s
+    /// batch `batch_id`.
+    pub fn is_nullifier_used(
+        env: Env,
+        funder: Address,
+        batch_id: u64,
+        nullifier: BytesN<32>,
+    ) -> bool {
         env.storage()
             .persistent()
-            .has(&DataKey::Nullifier(batch_id, nullifier))
+            .has(&DataKey::Nullifier(funder, batch_id, nullifier))
     }
 
-    /// Returns the batch with the given id, if it exists.
-    pub fn get_batch(env: Env, batch_id: u64) -> Option<Batch> {
-        env.storage().persistent().get(&DataKey::Batch(batch_id))
+    /// Returns `funder`'s batch with the given id, if it exists.
+    pub fn get_batch(env: Env, funder: Address, batch_id: u64) -> Option<Batch> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Batch(funder, batch_id))
     }
 }
 

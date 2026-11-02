@@ -126,7 +126,7 @@ fn fund_batch_stores_batch_and_pulls_total() {
     let s = setup();
 
     assert_eq!(
-        s.vault.get_batch(&BATCH_ID),
+        s.vault.get_batch(&s.funder, &BATCH_ID),
         Some(Batch {
             root: s.root.clone(),
             token: s.token.address.clone(),
@@ -223,6 +223,7 @@ fn batches_cannot_draw_on_each_others_funds() {
     assert_eq!(s.token.balance(&s.vault.address), BATCH_TOTAL + 5_000);
 
     let result = s.vault.try_withdraw(
+        &s.funder,
         &BATCH_ID,
         &proof(&s.env),
         &nullifier(&s.env, 1),
@@ -251,7 +252,7 @@ fn invalid_conservation_proof_is_rejected_without_state_change() {
     );
 
     assert_eq!(result, Err(Ok(VaultError::InvalidProof)));
-    assert_eq!(s.vault.get_batch(&BATCH_ID), None);
+    assert_eq!(s.vault.get_batch(&s.funder, &BATCH_ID), None);
     assert_eq!(s.token.balance(&s.funder), BATCH_TOTAL);
 }
 
@@ -270,8 +271,119 @@ fn registered_batch_id_cannot_be_reused() {
     );
 
     assert_eq!(result, Err(Ok(VaultError::BatchExists)));
-    assert_eq!(s.vault.get_batch(&BATCH_ID).unwrap().root, s.root);
+    assert_eq!(
+        s.vault.get_batch(&s.funder, &BATCH_ID).unwrap().root,
+        s.root
+    );
     assert_eq!(s.token.balance(&s.funder), BATCH_TOTAL);
+}
+
+// ---------------------------------------------------------------------------
+// Batch ids are per funder (ADR 0003)
+// ---------------------------------------------------------------------------
+
+/// A second funder holding a token of its own making, worth nothing.
+fn attacker_with_worthless_token(s: &Setup) -> (Address, Address) {
+    let attacker = Address::generate(&s.env);
+    let junk = s
+        .env
+        .register_stellar_asset_contract_v2(attacker.clone())
+        .address();
+    StellarAssetClient::new(&s.env, &junk).mint(&attacker, &BATCH_TOTAL);
+    (attacker, junk)
+}
+
+#[test]
+fn another_funder_registering_the_same_id_takes_nothing_over() {
+    // The attack from ADR 0002: copy a funder's root, total and proof under the same
+    // id, with a worthless token. It now only creates the attacker's own batch.
+    let s = deploy();
+    let (attacker, junk) = attacker_with_worthless_token(&s);
+    s.vault.fund_batch(
+        &attacker,
+        &BATCH_ID,
+        &junk,
+        &s.root,
+        &BATCH_TOTAL,
+        &proof(&s.env),
+    );
+
+    // The real funder registers the same id afterwards, and keeps the real token
+    s.vault.fund_batch(
+        &s.funder,
+        &BATCH_ID,
+        &s.token.address,
+        &s.root,
+        &BATCH_TOTAL,
+        &proof(&s.env),
+    );
+    assert_eq!(
+        s.vault.get_batch(&s.funder, &BATCH_ID).unwrap().token,
+        s.token.address
+    );
+    assert_eq!(s.vault.get_batch(&attacker, &BATCH_ID).unwrap().token, junk);
+
+    // A claim on the real funder's batch pays the real token
+    let recipient = Address::generate(&s.env);
+    s.vault.withdraw(
+        &s.funder,
+        &BATCH_ID,
+        &proof(&s.env),
+        &nullifier(&s.env, 1),
+        &recipient,
+        &2_500,
+    );
+    assert_eq!(s.token.balance(&recipient), 2_500);
+    assert_eq!(TokenClient::new(&s.env, &junk).balance(&recipient), 0);
+}
+
+#[test]
+fn nullifiers_are_scoped_per_funder() {
+    // The same id and nullifier under two funders are two different claims
+    let s = setup();
+    let (attacker, junk) = attacker_with_worthless_token(&s);
+    s.vault.fund_batch(
+        &attacker,
+        &BATCH_ID,
+        &junk,
+        &s.root,
+        &BATCH_TOTAL,
+        &proof(&s.env),
+    );
+    let n = nullifier(&s.env, 1);
+    s.vault.withdraw(
+        &attacker,
+        &BATCH_ID,
+        &proof(&s.env),
+        &n,
+        &Address::generate(&s.env),
+        &2_500,
+    );
+
+    assert!(s.vault.is_nullifier_used(&attacker, &BATCH_ID, &n));
+    assert!(!s.vault.is_nullifier_used(&s.funder, &BATCH_ID, &n));
+    let recipient = Address::generate(&s.env);
+    s.vault
+        .withdraw(&s.funder, &BATCH_ID, &proof(&s.env), &n, &recipient, &2_500);
+    assert_eq!(s.token.balance(&recipient), 2_500);
+}
+
+#[test]
+fn withdrawing_from_another_funders_id_finds_no_batch() {
+    let s = setup();
+    let result = s.vault.try_withdraw(
+        &Address::generate(&s.env),
+        &BATCH_ID,
+        &proof(&s.env),
+        &nullifier(&s.env, 1),
+        &Address::generate(&s.env),
+        &2_500,
+    );
+    assert_eq!(result, Err(Ok(VaultError::BatchNotFound)));
+    assert_eq!(
+        s.vault.get_batch(&Address::generate(&s.env), &BATCH_ID),
+        None
+    );
 }
 
 #[test]
@@ -323,7 +435,7 @@ fn funder_without_the_total_cannot_register() {
     );
 
     assert!(result.is_err());
-    assert_eq!(s.vault.get_batch(&BATCH_ID), None);
+    assert_eq!(s.vault.get_batch(&s.funder, &BATCH_ID), None);
     assert_eq!(s.token.balance(&s.funder), BATCH_TOTAL);
 }
 
@@ -426,7 +538,7 @@ fn real_conservation_proof_registers_the_batch() {
     );
 
     assert_eq!(
-        s.vault.get_batch(&b.batch_id),
+        s.vault.get_batch(&s.funder, &b.batch_id),
         Some(Batch {
             root: b.root.clone(),
             token: s.token.address.clone(),
@@ -461,7 +573,7 @@ fn real_conservation_proof_only_verifies_for_its_own_batch() {
             &b.proof,
         );
         assert_eq!(result, Err(Ok(VaultError::InvalidProof)));
-        assert_eq!(s.vault.get_batch(&batch_id), None);
+        assert_eq!(s.vault.get_batch(&s.funder, &batch_id), None);
     }
     assert_eq!(s.token.balance(&s.vault.address), 0);
 }
@@ -497,7 +609,7 @@ fn manipulated_real_proof_is_rejected() {
     off_curve.set(63, off_curve.get(63).unwrap() ^ 1);
     assert!(fund(&off_curve).is_err());
 
-    assert_eq!(s.vault.get_batch(&b.batch_id), None);
+    assert_eq!(s.vault.get_batch(&s.funder, &b.batch_id), None);
     assert_eq!(s.token.balance(&s.funder), b.total);
 }
 
@@ -512,12 +624,15 @@ fn withdraw_pays_recipient_and_marks_nullifier() {
     let n = nullifier(&s.env, 1);
 
     s.vault
-        .withdraw(&BATCH_ID, &proof(&s.env), &n, &recipient, &2_500);
+        .withdraw(&s.funder, &BATCH_ID, &proof(&s.env), &n, &recipient, &2_500);
 
     assert_eq!(s.token.balance(&recipient), 2_500);
     assert_eq!(s.token.balance(&s.vault.address), BATCH_TOTAL - 2_500);
-    assert!(s.vault.is_nullifier_used(&BATCH_ID, &n));
-    assert_eq!(s.vault.get_batch(&BATCH_ID).unwrap().withdrawn, 2_500);
+    assert!(s.vault.is_nullifier_used(&s.funder, &BATCH_ID, &n));
+    assert_eq!(
+        s.vault.get_batch(&s.funder, &BATCH_ID).unwrap().withdrawn,
+        2_500
+    );
 }
 
 #[test]
@@ -527,7 +642,7 @@ fn withdraw_passes_public_inputs_in_circuit_order() {
     let n = nullifier(&s.env, 1);
 
     s.vault
-        .withdraw(&BATCH_ID, &proof(&s.env), &n, &recipient, &2_500);
+        .withdraw(&s.funder, &BATCH_ID, &proof(&s.env), &n, &recipient, &2_500);
 
     // [root, nullifierHash, recipient, amount]
     let mut amount = [0u8; 32];
@@ -549,9 +664,10 @@ fn withdraw_emits_event() {
     let n = nullifier(&s.env, 1);
 
     s.vault
-        .withdraw(&BATCH_ID, &proof(&s.env), &n, &recipient, &2_500);
+        .withdraw(&s.funder, &BATCH_ID, &proof(&s.env), &n, &recipient, &2_500);
 
     let event = Withdrawn {
+        funder: s.funder.clone(),
         batch_id: BATCH_ID,
         nullifier: n,
         recipient,
@@ -569,6 +685,7 @@ fn whole_batch_can_be_withdrawn_exactly() {
     for (i, amount) in [6_000i128, 4_000].iter().enumerate() {
         let recipient = Address::generate(&s.env);
         s.vault.withdraw(
+            &s.funder,
             &BATCH_ID,
             &proof(&s.env),
             &nullifier(&s.env, i as u8 + 1),
@@ -576,7 +693,7 @@ fn whole_batch_can_be_withdrawn_exactly() {
             amount,
         );
     }
-    let batch = s.vault.get_batch(&BATCH_ID).unwrap();
+    let batch = s.vault.get_batch(&s.funder, &BATCH_ID).unwrap();
     assert_eq!(batch.withdrawn, batch.total);
     assert_eq!(s.token.balance(&s.vault.address), 0);
 }
@@ -592,10 +709,10 @@ fn double_claim_with_same_nullifier_is_rejected() {
     let n = nullifier(&s.env, 1);
 
     s.vault
-        .withdraw(&BATCH_ID, &proof(&s.env), &n, &recipient, &2_500);
+        .withdraw(&s.funder, &BATCH_ID, &proof(&s.env), &n, &recipient, &2_500);
     let result = s
         .vault
-        .try_withdraw(&BATCH_ID, &proof(&s.env), &n, &recipient, &2_500);
+        .try_withdraw(&s.funder, &BATCH_ID, &proof(&s.env), &n, &recipient, &2_500);
 
     assert_eq!(result, Err(Ok(VaultError::NullifierUsed)));
     assert_eq!(s.token.balance(&recipient), 2_500);
@@ -610,10 +727,10 @@ fn double_claim_is_reported_as_such_when_the_batch_is_nearly_drained() {
     let n = nullifier(&s.env, 1);
 
     s.vault
-        .withdraw(&BATCH_ID, &proof(&s.env), &n, &recipient, &6_000);
+        .withdraw(&s.funder, &BATCH_ID, &proof(&s.env), &n, &recipient, &6_000);
     let result = s
         .vault
-        .try_withdraw(&BATCH_ID, &proof(&s.env), &n, &recipient, &6_000);
+        .try_withdraw(&s.funder, &BATCH_ID, &proof(&s.env), &n, &recipient, &6_000);
 
     assert_eq!(result, Err(Ok(VaultError::NullifierUsed)));
     assert_eq!(s.token.balance(&recipient), 6_000);
@@ -625,6 +742,7 @@ fn replayed_nullifier_to_a_different_recipient_is_rejected() {
     let n = nullifier(&s.env, 1);
 
     s.vault.withdraw(
+        &s.funder,
         &BATCH_ID,
         &proof(&s.env),
         &n,
@@ -634,7 +752,7 @@ fn replayed_nullifier_to_a_different_recipient_is_rejected() {
     let attacker = Address::generate(&s.env);
     let result = s
         .vault
-        .try_withdraw(&BATCH_ID, &proof(&s.env), &n, &attacker, &2_500);
+        .try_withdraw(&s.funder, &BATCH_ID, &proof(&s.env), &n, &attacker, &2_500);
 
     assert_eq!(result, Err(Ok(VaultError::NullifierUsed)));
     assert_eq!(s.token.balance(&attacker), 0);
@@ -649,6 +767,7 @@ fn non_canonical_nullifier_is_rejected() {
 
     for n in [at_modulus, above] {
         let result = s.vault.try_withdraw(
+            &s.funder,
             &BATCH_ID,
             &proof(&s.env),
             &n,
@@ -664,6 +783,7 @@ fn nullifiers_are_scoped_per_batch() {
     let s = setup();
     let n = nullifier(&s.env, 1);
     s.vault.withdraw(
+        &s.funder,
         &BATCH_ID,
         &proof(&s.env),
         &n,
@@ -671,8 +791,8 @@ fn nullifiers_are_scoped_per_batch() {
         &2_500,
     );
 
-    assert!(s.vault.is_nullifier_used(&BATCH_ID, &n));
-    assert!(!s.vault.is_nullifier_used(&(BATCH_ID + 1), &n));
+    assert!(s.vault.is_nullifier_used(&s.funder, &BATCH_ID, &n));
+    assert!(!s.vault.is_nullifier_used(&s.funder, &(BATCH_ID + 1), &n));
 }
 
 // ---------------------------------------------------------------------------
@@ -688,11 +808,14 @@ fn invalid_proof_is_rejected_without_state_change() {
 
     let result = s
         .vault
-        .try_withdraw(&BATCH_ID, &proof(&s.env), &n, &recipient, &2_500);
+        .try_withdraw(&s.funder, &BATCH_ID, &proof(&s.env), &n, &recipient, &2_500);
 
     assert_eq!(result, Err(Ok(VaultError::InvalidProof)));
-    assert!(!s.vault.is_nullifier_used(&BATCH_ID, &n));
-    assert_eq!(s.vault.get_batch(&BATCH_ID).unwrap().withdrawn, 0);
+    assert!(!s.vault.is_nullifier_used(&s.funder, &BATCH_ID, &n));
+    assert_eq!(
+        s.vault.get_batch(&s.funder, &BATCH_ID).unwrap().withdrawn,
+        0
+    );
     assert_eq!(s.token.balance(&recipient), 0);
 }
 
@@ -700,6 +823,7 @@ fn invalid_proof_is_rejected_without_state_change() {
 fn over_withdrawal_is_rejected() {
     let s = setup();
     let result = s.vault.try_withdraw(
+        &s.funder,
         &BATCH_ID,
         &proof(&s.env),
         &nullifier(&s.env, 1),
@@ -713,6 +837,7 @@ fn over_withdrawal_is_rejected() {
 fn withdrawal_beyond_remaining_balance_is_rejected() {
     let s = setup();
     s.vault.withdraw(
+        &s.funder,
         &BATCH_ID,
         &proof(&s.env),
         &nullifier(&s.env, 1),
@@ -720,6 +845,7 @@ fn withdrawal_beyond_remaining_balance_is_rejected() {
         &8_000,
     );
     let result = s.vault.try_withdraw(
+        &s.funder,
         &BATCH_ID,
         &proof(&s.env),
         &nullifier(&s.env, 2),
@@ -733,6 +859,7 @@ fn withdrawal_beyond_remaining_balance_is_rejected() {
 fn unknown_batch_is_rejected() {
     let s = setup();
     let result = s.vault.try_withdraw(
+        &s.funder,
         &99,
         &proof(&s.env),
         &nullifier(&s.env, 1),
@@ -747,6 +874,7 @@ fn invalid_amounts_are_rejected() {
     let s = setup();
     for amount in [0i128, -1, MAX_AMOUNT_EXCLUSIVE] {
         let result = s.vault.try_withdraw(
+            &s.funder,
             &BATCH_ID,
             &proof(&s.env),
             &nullifier(&s.env, 1),
@@ -814,7 +942,7 @@ fn withdraw_extends_batch_and_instance_ttl() {
                 s.env
                     .storage()
                     .persistent()
-                    .get_ttl(&DataKey::Batch(BATCH_ID)),
+                    .get_ttl(&DataKey::Batch(s.funder.clone(), BATCH_ID)),
                 s.env.storage().instance().get_ttl(),
             )
         })
@@ -822,6 +950,7 @@ fn withdraw_extends_batch_and_instance_ttl() {
 
     // First claim: the instance is at the full period
     s.vault.withdraw(
+        &s.funder,
         &BATCH_ID,
         &proof(&s.env),
         &nullifier(&s.env, 1),
@@ -839,6 +968,7 @@ fn withdraw_extends_batch_and_instance_ttl() {
 
     // ...and the next claim extends them back to the full period
     s.vault.withdraw(
+        &s.funder,
         &BATCH_ID,
         &proof(&s.env),
         &nullifier(&s.env, 2),
